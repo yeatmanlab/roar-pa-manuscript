@@ -1,0 +1,516 @@
+---
+title: "ROAR-data f_p Analysis Short"
+author: "Wanjing Anya Ma"
+date:  "`r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 4
+    theme: cosmo
+    highlight: tango
+---
+
+# Load Packages
+
+Let's first load the packages that we need for this chapter.
+
+```{r, message=FALSE, warning = FALSE, echo = FALSE}
+library("knitr") # for rendering the RMarkdown file
+library("tidyverse") # for data wrangling 
+library(dplyr)
+library('ggpubr')
+library(ggplot2)
+library(caTools)
+library(ROCR) 
+library(caret)
+source("../code/preprocessData_new_PA.R")
+source("../code/preprocessData_new_SWR.R")
+library("modelr")
+library(pROC)
+library(viridis)
+library(gridExtra)
+library(sjPlot)
+library(mgcv)
+```
+
+# Settings
+
+```{r echo = FALSE}
+# sets how code looks in knitted document
+opts_chunk$set(comment = "")
+# suppresses warning about grouping 
+options(dplyr.summarise.inform = F)
+```
+
+# Data
+
+## Data Loading
+
+Load f_p data
+
+```{r}
+df.fp_data <- read.csv("~/Documents/Data/school_deidentified_data/school_ca_01/fp_data.csv")
+```
+
+Load roar data
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+# all grade data
+
+df.trials_swr <- read_csv("~/Documents/Data/school_deidentified_data/school_ca_01/Fall2022/roar_swr_trials.csv") 
+df.trials_pa <- read_csv("~/Documents/Data/school_deidentified_data/school_ca_01/Fall2022/roar_pa_trials.csv")
+df.trials_pa_more <- read_csv("~/Documents/Data/school_deidentified_data/school_ca_01/Fall2022/roar_pa_trials_add.csv") 
+```
+
+## Data Wrangling
+
+```{r}
+df.distinct_trials_pa <- dropDuplicate(df.trials_pa %>% filter(completed == TRUE))
+df.score_pa <- generateScoreFile(df.distinct_trials_pa)
+df.score_details_pa <- generateDetailedScoreFile(df.distinct_trials_pa)
+
+df.clean_pa_firebase <- df.score_details_pa %>% 
+  rename(pa_score = "roar_score") %>% 
+  select(subj, FSM_correct, LSM_correct, DEL_correct, pa_score)
+
+df.score_pa <- df.trials_pa_more %>% 
+  select(-c(...1, ...2, timestmp, session)) %>% 
+  pivot_longer(cols = contains("correct")) %>% 
+  mutate(name = substring(name, 9,11)) %>% 
+  group_by(subj, name) %>% 
+  summarise(score = sum(value)) %>% 
+  pivot_wider(names_from = "name", values_from = "score") %>% 
+  rename(DEL_correct = "DEL", LSM_correct = "LSM", FSM_correct = "FSM") %>% 
+  mutate(pa_score = DEL_correct + FSM_correct + LSM_correct ) %>% 
+  filter(! is.na(pa_score)) %>% 
+  select(subj, FSM_correct, LSM_correct, DEL_correct, pa_score) %>% 
+  rbind(df.clean_pa_firebase) %>% 
+  arrange(subj) %>% 
+  rename(pid = 'subj')
+  
+df.distinct_trials_swr <- dropDuplicateSWR(df.trials_swr)
+df.score_swr <- getSWRthetaEstimate(df.distinct_trials_swr) %>% 
+  filter(trialNumTotal == 100)
+
+length(df.score_swr$pid)
+length(df.score_pa$pid)
+
+df.roar_score <- df.score_swr %>%  
+  select(pid, thetaEstimate, thetaSE) %>% 
+  inner_join(df.score_pa , by = "pid")
+
+```
+
+There are 688 students who completed ROAR-SWR, and 657 students who completed ROAR-PA. And 632 students completed both tasks.
+
+```{r}
+df.combined <- df.roar_score %>% 
+  left_join(df.fp_data %>% select(pid, novfpreadinglevel
+, gradelevel), by = "pid") %>% 
+  filter(!is.na(novfpreadinglevel))
+
+length(df.combined$pid)
+```
+
+And 452 of them have novfpreadinglevel.
+
+```{r}
+df.data <- df.combined %>% 
+  mutate(novfpreadinglevel = tolower(novfpreadinglevel)) %>% 
+  mutate(new_score = if_else(novfpreadinglevel == "below a", 'a', novfpreadinglevel)) %>% 
+  mutate(novfpreadinglevel_numeric = match(unlist(strsplit(new_score , split="")), letters)) %>% 
+  mutate(risk = if_else(((novfpreadinglevel_numeric < 5) & (gradelevel == 1)) | ((novfpreadinglevel_numeric < 10) & (gradelevel == 2)) , 1, 0)) %>% 
+  select(-new_score)
+```
+
+# Compare ROAR score with f_p data
+
+```{r}
+df.data_longer <- df.data %>% 
+  pivot_longer(cols = c(FSM_correct, LSM_correct, DEL_correct), 
+               names_to = "skills", 
+               values_to = "count")
+```
+
+```{r}
+df.data.1 <- df.data %>% filter(gradelevel == 1)
+df.data.2 <- df.data %>% filter(gradelevel == 2)
+```
+
+```{r}
+cor.test(df.data.1$pa_score, df.data.1$novfpreadinglevel_numeric,  method = "pearson")
+cor.test(df.data.2$pa_score, df.data.2$novfpreadinglevel_numeric,  method = "pearson")
+```
+
+## Visualization
+
+### ROAR-PA and ROAR-SWR plots
+```{r}
+x <- "hi"
+xl <- expression(Speed ~ ms^-1 ~ by ~ impeller)
+xl
+```
+
+```{r}
+df.data$gradelevelF <- factor(x=df.data$gradelevel,levels=c(1,2),labels=c("First Grade", "Second Grade"))
+
+g1 <-ggplot(df.data, aes(x = pa_score,
+                     y = novfpreadinglevel_numeric, color= thetaEstimate)) + 
+  geom_point() + scale_color_viridis(option = 'plasma')+
+  xlim(0, 60) +
+  labs(x = "ROAR-PA total correct",
+       y = "Fountas & Pinnell") +
+  scale_y_continuous(breaks = c(2,5,8,11,14),labels=c('B', 'E', 'H','K','N'))+
+  geom_smooth(method = "lm",color = "black") +
+  stat_cor(cor.coef.name = 'r', aes(label = ..r.label..), color = "black", 
+           geom = "label",vjust = .6) +
+  facet_grid(cols = vars(gradelevelF))+
+  labs(color = 'ROAR-SWR\ntheta')
+
+g2 <- ggplot(df.data, mapping = aes(x = thetaEstimate,
+                     y = novfpreadinglevel_numeric, color=pa_score)) + 
+  geom_point() + 
+  labs(x = "ROAR-SWR theta",
+       y = "Fountas & Pinnell") +
+  geom_smooth(method = "lm", color="black") +
+  scale_color_viridis(option = 'plasma')+
+  scale_y_continuous(breaks = c(2,5,8,11,14),labels=c('B', 'E', 'H','K','N'))+
+  stat_cor(cor.coef.name = 'r', aes(label = ..r.label..), color = "black", 
+           geom = "label", vjust = -.2) +
+  facet_grid(cols = vars(gradelevelF)) +
+  labs(color = 'ROAR-PA \ntotal correct')
+
+g <- grid.arrange(g1, g2, nrow = 2)
+ggsave('ROAR-PA_FandP.pdf',g, height = 6 , width = 6)
+```
+
+### ROAR-SWR
+
+```{r}
+g1 <- ggplot(df.data, mapping = aes(x = thetaEstimate,
+                     y = novfpreadinglevel_numeric, color=pa_score)) + 
+  geom_point() + 
+  labs(x = "ROAR-SWR theta",
+       y = "Fountas & Pinnell") +
+  geom_smooth(method = "lm", color="black") +
+  scale_color_viridis(option = 'plasma')+
+  scale_y_continuous(breaks = c(2,5,8,11,14),labels=c('B', 'E', 'H','K','N'))+
+  stat_cor(aes(label = ..r.label..), color = "black", 
+           geom = "label", hjust = -0.3, vjust = 1) +
+  facet_grid(cols = vars(gradelevel)) +
+  labs(color = 'ROAR-PA\ntheta')
+
+
+```
+
+```{r}
+# Make a plot of each PA subtest agains F and P
+ggplot(df.data_longer, mapping = aes(x = count,
+                     y = novfpreadinglevel_numeric, 
+                     group = skills,
+                     color = skills)) + 
+  geom_point() + 
+  labs(x = "ROAR-PA correct percentile",
+       y = "f_p reading level in Nov 2022 (numeric scale)") +
+  geom_smooth(method = "lm") +
+  stat_cor(aes(label = ..r.label..), color = "black", 
+           geom = "label", hjust = -0.3, vjust = 1) +
+  facet_grid(cols = vars(skills), rows = vars(gradelevel))
+
+```
+
+## Regression Model
+
+### PA_numer_correct
+
+```{r}
+# fit regression model predicting F and P based on individual subtests
+# First fit a model with just PA total and it is a good predictor
+lm.g <- lm(formula = novfpreadinglevel_numeric ~ gradelevel,
+         data = df.data) 
+lm.PA.1 <- lm(formula = novfpreadinglevel_numeric ~ pa_score + gradelevel,
+         data = df.data) 
+lm.PA.2 <- lm(formula = novfpreadinglevel_numeric ~ pa_score + gradelevel+ DEL_correct + LSM_correct + FSM_correct,
+         data = df.data) 
+```
+
+### Compare Models
+
+lm.g = 0.36, lm.PA.1 = 0.56, lm.PA.2 = 0.56
+
+```{r}
+summary(lm.g)
+summary(lm.PA.1)
+summary(lm.PA.2)
+
+# When we add in the sub-scores we can see that they contribute additional 
+# information above the total score (it is significant but not much). But if we 
+# Add grade subtests don't contribute more above grade and total
+anova(lm.g, lm.PA.1, lm.PA.2)
+```
+
+ROAR-SWR: 0.73, ROAR-SWR + ROAR-PA: 0.76
+
+```{r}
+# Now we'll check wether PA gives more information than SWR
+# Now fit model with PA and SWR
+lm.SWR <- lm(formula = novfpreadinglevel_numeric ~ thetaEstimate + gradelevel,
+         data = df.data)
+lm.PA <- lm(formula = novfpreadinglevel_numeric ~ pa_score + gradelevel,
+         data = df.data)
+lm.PA.SWR <- lm(formula = novfpreadinglevel_numeric ~ pa_score + thetaEstimate + gradelevel, data = df.data)
+                
+summary(lm.SWR)
+summary(lm.PA)
+summary(lm.PA.SWR)
+anova(lm.SWR, lm.PA.SWR)
+```
+
+### 1st grade only
+
+```{r}
+# Now we'll check wether PA gives more information than SWR
+# Now fit model with PA and SWR
+lm.SWR.1 <- lm(formula = novfpreadinglevel_numeric ~ thetaEstimate ,
+         data = df.data %>% filter(gradelevel == 1))
+lm.PA.SWR.1 <- lm(formula = novfpreadinglevel_numeric ~ pa_score + thetaEstimate ,
+         data = df.data %>% filter(gradelevel == 1))
+summary(lm.SWR.1)
+summary(lm.PA.SWR.1)
+anova(lm.SWR.1, lm.PA.SWR.1)
+```
+
+### 2nd grade only
+
+```{r}
+# Now we'll check wether PA gives more information than SWR
+# Now fit model with PA and SWR
+lm.SWR.2 <- lm(formula = novfpreadinglevel_numeric ~ thetaEstimate ,
+         data = df.data %>% filter(gradelevel == 2))
+lm.PA.SWR.2 <- lm(formula = novfpreadinglevel_numeric ~ pa_score + thetaEstimate ,
+         data = df.data %>% filter(gradelevel == 2))
+summary(lm.SWR.2)
+summary(lm.PA.SWR.2)
+anova(lm.SWR.2, lm.PA.SWR.2)
+```
+
+## Risk Classification
+
+### Without Cross Validation 
+
+```{r}
+gam_model.swr.1 <- gam(risk ~ s(thetaEstimate), data = df.data %>% filter(gradelevel == 1), family = "binomial")
+
+gam_model.pa.1 <- gam(risk ~ s(pa_score) , data = df.data %>% filter(gradelevel == 1), family = "binomial")
+
+gam_model.swr.pa.1 <- gam(risk ~ te(thetaEstimate, pa_score), data = df.data %>% filter(gradelevel == 1), family = "binomial")
+```
+
+
+```{r}
+generateModelPredictionResults.simple <- function (models, data) {
+  list.name <- c()
+  list.auc <- c()
+  list.sensitivity <- c()
+  list.specificity <- c()
+  list.accuracy <- c()
+  
+  for(i in 1:length(models)){
+    
+    predictions <- predict(models[[i]], type = 'response')
+    
+    table <- tibble(pred = predictions, 
+           Y = data$risk) %>% 
+  mutate(pred = ifelse(pred <= 0.5, 0, 1))
+    
+    summary <- table %>% 
+      mutate(acc = ifelse(pred == Y, 1, 0)) %>% 
+      summarise(mean = mean(acc))
+    
+
+    cm <- confusionMatrix(factor(table$pred), factor(data$risk))
+    overall <- cm$overall
+    result <- cm$byClass
+    
+    
+    list.name <- c(list.name, names(models)[i] )
+    list.accuracy <- c(list.accuracy, round(as.numeric(overall['Accuracy']), digits = 3))
+    list.sensitivity <- c(list.sensitivity, round(as.numeric(result['Sensitivity']), digits = 3))
+    list.specificity <- c(list.specificity, round(as.numeric(result['Specificity']), digits = 3))
+    
+    r = roc(response = table$Y, predictor = predictions)
+    list.auc <- c(list.auc, round(as.numeric(r$auc), digits = 3))
+    
+  }
+  
+  return (tibble(name = list.name, 
+                 accuracy = list.accuracy,
+         sensitivity = list.sensitivity, 
+         specificity = list.specificity,
+         auc = list.auc))
+}
+
+model.compare.1 <- generateModelPredictionResults.simple(
+  list("gam_model.swr" = gam_model.swr.1, 
+       "gam_model.pa" = gam_model.pa.1, 
+       "gam_model.swr.pa" = gam_model.swr.pa.1), 
+  df.data %>% filter(gradelevel == 1))
+```
+
+```{r}
+gam_model.swr.2 <- gam(risk ~ s(thetaEstimate), data = df.data %>% filter(gradelevel == 2), family = "binomial")
+
+gam_model.pa.2 <- gam(risk ~ s(pa_score), data = df.data %>% filter(gradelevel == 2), family = "binomial")
+
+gam_model.swr.pa.2 <- gam(risk ~ te(thetaEstimate, pa_score), data = df.data %>% filter(gradelevel == 2), family = "binomial")
+
+```
+
+Model Comparison Results without cross validation:
+```{r}
+model.compare.2 <- generateModelPredictionResults.simple(
+  list("gam_model.swr" = gam_model.swr.2, 
+       "gam_model.pa" = gam_model.pa.2, 
+       "gam_model.swr.pa" = gam_model.swr.pa.2), 
+  df.data %>% filter(gradelevel == 2))
+
+df.models <- model.compare.1 %>% 
+  mutate(grade = 1) %>% 
+  rbind(model.compare.2 %>% mutate(grade=2)) %>% 
+  rename(model = "name") %>% 
+  relocate(grade)
+
+df.models
+```
+```{r}
+tab_df(df.models, file="models.doc") 
+```
+
+
+# Spring 2022 data predicts f_p outcome
+
+## read data
+
+We have 130 students who are qualified in this analysis:\
+1. completed both SWR and PA in spring 2022\
+2. received a f_p score in November 2022\
+
+```{r}
+df.data_2022_spring <- read_csv("~/Documents/Data/school_deidentified_data/school_ca_01/roar_data_2022_spring.csv") 
+
+df.fp_2021_2022 <- read_csv("~/Documents/Data/school_deidentified_data/school_ca_01/fp_data_2021_2022.csv") 
+```
+
+```{r}
+# merge novfpreadinglevel into the dataframe
+df.data.22.spring <- df.data_2022_spring %>% 
+  left_join(df.fp_data, by = 'pid') %>% 
+  mutate(novfpreadinglevel = tolower(novfpreadinglevel)) %>% 
+  mutate(new_score = if_else(novfpreadinglevel == "below a", 'a', novfpreadinglevel)) %>% 
+  mutate(novfpreadinglevel_numeric = match(unlist(strsplit(new_score , split="")), letters)) %>% 
+  mutate(risk = if_else(((novfpreadinglevel_numeric < 5) & (gradelevel == 1)) | ((novfpreadinglevel_numeric < 10) & (gradelevel == 2)) , 1, 0)) %>% 
+  filter(!is.na(novfpreadinglevel)) %>% 
+  select(-c(new_score, ...1))
+
+length(df.data.22.spring$pid)
+```
+
+```{r}
+df.a <- df.fp_2021_2022 %>% 
+  left_join(df.fp_data, by = 'pid') %>% 
+  mutate(novfpreadinglevel = tolower(novfpreadinglevel)) %>% 
+  mutate(new_score = if_else(novfpreadinglevel == "below a", 'a', novfpreadinglevel)) %>% 
+  mutate(novfpreadinglevel_numeric = match(unlist(strsplit(new_score , split="")), letters)) %>% 
+  mutate(risk = if_else(((novfpreadinglevel_numeric < 5) & (gradelevel == 1)) | ((novfpreadinglevel_numeric < 10) & (gradelevel == 2)) , 1, 0)) %>% 
+  filter(!is.na(novfpreadinglevel)) %>% 
+  select(-c(new_score, ...1))
+```
+
+```{r}
+df.data.fp <- df.a %>% 
+  filter(!is.na(fp_level_03_2022)) %>% 
+  select(pid, fp_level_03_2022, risk) %>% 
+  mutate(fp_level_03_2022 = tolower(fp_level_03_2022)) %>% 
+   mutate(new_score = if_else(fp_level_03_2022 == "aa", 'a', fp_level_03_2022)) %>% 
+  mutate(fp_level_03_2022_numeric = match(unlist(strsplit(new_score, split="")), letters))
+
+g.fp.spring <- gam(risk ~ te(fp_level_03_2022_numeric), data = df.data.fp, family = binomial)
+
+p.fp.spring = predict(g.fp.spring,  type = 'response')
+
+
+r.g.fp.spring = roc(response = g.fp.spring$y, predictor = p.fp.spring)
+print(r.g.fp.spring)
+
+df.data.fp <- df.a %>% 
+  filter(!is.na(fp_level_06_2022)) %>% 
+  select(pid, fp_level_06_2022, risk) %>% 
+  mutate(fp_level_06_2022 = tolower(fp_level_06_2022)) %>% 
+   mutate(new_score = if_else(fp_level_06_2022 == "aa", 'a', fp_level_06_2022)) %>% 
+  mutate(fp_level_06_2022_numeric = match(unlist(strsplit(new_score, split="")), letters))
+
+g.fp.spring <- gam(risk ~ te(fp_level_06_2022_numeric), data = df.data.fp, family = binomial)
+
+p.fp.spring = predict(g.fp.spring,  type = 'response')
+
+
+r.g.fp.spring = roc(response = g.fp.spring$y, predictor = p.fp.spring)
+print(r.g.fp.spring)
+```
+
+
+## Visualization
+
+```{r}
+ggplot(df.data.22.spring, mapping = aes(x = pa_score,
+                     y = novfpreadinglevel_numeric)) + 
+  geom_point() + 
+  labs(x = "ROAR-PA total correct in Spring 2022",
+       y = "f_p reading level in Nov 2022 (numeric scale)") +
+  geom_smooth(method = "lm") +
+  stat_cor(aes(label = ..r.label..), color = "black", 
+           geom = "label", hjust = -0.3, vjust = 1) +
+  facet_grid(cols = vars(gradelevel))
+
+ggplot(df.data.22.spring, mapping = aes(x = roar_swr,
+                     y = novfpreadinglevel_numeric)) + 
+  geom_point() + 
+  labs(x = "ROAR-SWR total correct (Block A only) in Spring 2022",
+       y = "f_p reading level in Nov 2022 (numeric scale)") +
+  geom_smooth(method = "lm") +
+  stat_cor(aes(label = ..r.label..), color = "black", 
+           geom = "label", hjust = -0.3, vjust = 1) +
+  facet_grid(cols = vars(gradelevel))
+```
+
+## GAM (without splitting)
+
+```{r}
+# classification
+g.swr.spring <- gam(risk ~ te(roar_swr), data = df.data.22.spring, family = binomial)
+
+g.swr.pa.spring <- gam(risk ~ te(roar_swr, pa_score), data = df.data.22.spring, family = binomial)
+
+g.pa.spring <- gam(risk ~ te(pa_score), data = df.data.22.spring, family = binomial)
+
+summary(g.swr.spring)
+summary(g.pa.spring)
+summary(g.swr.pa.spring)
+
+p.swr.spring = predict(g.swr.spring,  type = 'response')
+p.pa.spring = predict(g.pa.spring,  type = 'response')
+p.swr.pa.spring = predict(g.swr.pa.spring,  type = 'response')
+
+r.g.swr.spring = roc(response = g.swr.spring$y, predictor = p.swr.spring)
+print(r.g.swr.spring)
+r.g.pa.spring = roc(response = g.pa.spring$y, predictor = p.pa.spring)
+print(r.g.pa.spring)
+r.g.swr.pa.spring = roc(response = g.swr.pa.spring$y, predictor = p.swr.pa.spring)
+print(r.g.swr.pa.spring)
+
+```
+
+GAM: use Spring 2022 roar data to predict Nov 2022 f_p\
+1. AUC of ROAR_SWR: 0.8255\
+2. AUC of ROAR_PA: 0.7072\
+3. AUC of ROAR_SWR + ROAR_PA: 0.8385
